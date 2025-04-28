@@ -94,7 +94,7 @@ parser.add_argument("--squared_dice", action="store_true", help="use squared Dic
 def main():
     args = parser.parse_args()
     args.amp = not args.noamp
-    args.logdir = "./runs/" + args.logdir
+    args.logdir = f"benchmark_brats21_nested/fold_{args.fold}"
     if args.distributed:
         args.ngpus_per_node = torch.cuda.device_count()
         print("Found total gpus", args.ngpus_per_node)
@@ -120,12 +120,11 @@ def main_worker(gpu, args):
     loader = get_loader(args)
     print(args.rank, " gpu", args.gpu)
     if args.rank == 0:
-        print("Batch size is:", args.batch_size, "epochs", args.max_epochs)
+        print("Batch size:", args.batch_size, ", epochs:", args.max_epochs)
     inf_size = [args.roi_x, args.roi_y, args.roi_z]
     pretrained_dir = args.pretrained_dir
     model_name = args.pretrained_model_name
     pretrained_pth = os.path.join(pretrained_dir, model_name)
-
     model = SwinUNETR(
         img_size=(args.roi_x, args.roi_y, args.roi_z),
         in_channels=args.in_channels,
@@ -145,6 +144,8 @@ def main_worker(gpu, args):
         )
     else:
         dice_loss = DiceLoss(to_onehot_y=False, sigmoid=True)
+    ## JJ: CrE-loss
+
     post_sigmoid = Activations(sigmoid=True)
     post_pred = AsDiscrete(argmax=False, logit_thresh=0.5)
     dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH, get_not_nans=True)

@@ -132,7 +132,9 @@ def get_loader(args):
     )
 
     if args.test_mode:
-        val_ds = data.Dataset(data=validation_files, transform=test_transform)
+        import pdb;pdb.set_trace()
+        # why no file name??
+        val_ds = data.Dataset(data=validation_files, transform=test_transform) # validation_files[List]->["filename_or_obj"] 转化为batch里的key
         val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
         test_loader = data.DataLoader(
             val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True

@@ -61,6 +61,7 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
                 "time {:.2f}s".format(time.time() - start_time),
             )
         start_time = time.time()
+        break # JJ
     for param in model.parameters():
         param.grad = None
     return run_loss.avg
@@ -180,7 +181,7 @@ def run_training(
                 post_sigmoid=post_sigmoid,
                 post_pred=post_pred,
             )
-
+            # pdb.set_trace() # JJ
             if args.rank == 0:
                 Dice_TC = val_acc[0]
                 Dice_WT = val_acc[1]
@@ -211,6 +212,7 @@ def run_training(
                         save_checkpoint(
                             model, epoch, args, best_acc=val_acc_max, optimizer=optimizer, scheduler=scheduler
                         )
+            # pdb.set_trace()
             if args.rank == 0 and args.logdir is not None and args.save_checkpoint:
                 save_checkpoint(model, epoch, args, best_acc=val_acc_max, filename="model_final.pt")
                 if b_new_best:

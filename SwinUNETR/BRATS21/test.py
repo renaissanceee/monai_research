@@ -25,8 +25,8 @@ parser = argparse.ArgumentParser(description="Swin UNETR segmentation pipeline")
 parser.add_argument("--data_dir", default="/dataset/dataset0/", type=str, help="dataset directory")
 parser.add_argument("--exp_name", default="test1", type=str, help="experiment name")
 parser.add_argument("--json_list", default="dataset_0.json", type=str, help="dataset json file")
-parser.add_argument("--fold", default=1, type=int, help="data fold")
-parser.add_argument("--pretrained_model_name", default="model.pt", type=str, help="pretrained model name")
+parser.add_argument("--fold", default=0, type=int, help="data fold")
+parser.add_argument("--pretrained_model_name", default="model_final.pt", type=str, help="pretrained model name")
 parser.add_argument("--feature_size", default=48, type=int, help="feature size")
 parser.add_argument("--infer_overlap", default=0.6, type=float, help="sliding window inference overlap")
 parser.add_argument("--in_channels", default=4, type=int, help="number of input channels")
@@ -61,14 +61,16 @@ parser.add_argument(
 def main():
     args = parser.parse_args()
     args.test_mode = True
-    output_directory = "./outputs/" + args.exp_name
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
+    # output_directory = "./outputs/" + args.exp_name
+    # if not os.path.exists(output_directory):
+    #     os.makedirs(output_directory)
     test_loader = get_loader(args)
-    pretrained_dir = args.pretrained_dir
-    model_name = args.pretrained_model_name
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pretrained_pth = os.path.join(pretrained_dir, model_name)
+    # load ckpt
+    pretrained_pth = os.path.join(args.pretrained_dir,f'fold_{args.fold}', args.pretrained_model_name)
+    # save path
+    output_directory = os.path.join(args.pretrained_dir,f'fold_{args.fold}', 'results')
+    os.makedirs(output_directory, exist_ok=True)
     model = SwinUNETR(
         img_size=128,
         in_channels=args.in_channels,
@@ -93,20 +95,27 @@ def main():
     )
 
     with torch.no_grad():
-        for i, batch in enumerate(test_loader):
+        for i, batch in enumerate(test_loader):  # len(test_loader)
+            # batch.keys(): ['fold', 'image', 'label']
             image = batch["image"].cuda()
-            affine = batch["image_meta_dict"]["original_affine"][0].numpy()
-            num = batch["image_meta_dict"]["filename_or_obj"][0].split("/")[-1].split("_")[1]
+            # affine = batch["image_meta_dict"]["original_affine"][0].numpy()
+            # num = batch["image_meta_dict"]["filename_or_obj"][0].split("/")[-1].split("_")[1]
+            affine = None
+            num = '00000'
+            import pdb;pdb.set_trace()
             img_name = "BraTS2021_" + num + ".nii.gz"
             print("Inference on case {}".format(img_name))
-            prob = torch.sigmoid(model_inferer_test(image))
-            seg = prob[0].detach().cpu().numpy()
+            prob = torch.sigmoid(model_inferer_test(image))# [1, 3, 240, 240, 155]
+            seg = prob[0].detach().cpu().numpy()# [3, 240, 240, 155]
             seg = (seg > 0.5).astype(np.int8)
             seg_out = np.zeros((seg.shape[1], seg.shape[2], seg.shape[3]))
-            seg_out[seg[1] == 1] = 2
-            seg_out[seg[0] == 1] = 1
-            seg_out[seg[2] == 1] = 4
+            # actually overwritten here
+            # seg[0]-et, seg[1]-wt, seg[2]-tc(nec)
+            seg_out[seg[1] == 1] = 2 # wt (green+blue+red)
+            seg_out[seg[0] == 1] = 1 # enhanced (blue)
+            seg_out[seg[2] == 1] = 4 # nerosis (red)
             nib.save(nib.Nifti1Image(seg_out.astype(np.uint8), affine), os.path.join(output_directory, img_name))
+            asd
         print("Finished inference!")
 
 

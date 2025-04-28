@@ -133,3 +133,6 @@ tests/testing_data/*Hippocampus*
 
 # Temporary workspace
 tmp_*_dir/
+
+# output
+BRATS21/runs/
