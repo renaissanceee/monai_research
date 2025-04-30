@@ -136,3 +136,5 @@ tmp_*_dir/
 
 # output
 BRATS21/runs/
+BRATS21/pretrained_models/
+BRATS21/benchmark_brats21_nested/

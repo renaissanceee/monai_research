@@ -13,19 +13,23 @@ import argparse
 import os
 from functools import partial
 from batchgenerators.utilities.file_and_folder_operations import join, isfile, load_json, save_json
-import json
-from pathlib import Path
-import re
 import nibabel as nib
 import numpy as np
 import torch
 from utils.data_utils import get_loader
+from torch import autocast, nn
 import torch.nn.functional as F
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import SwinUNETR
+from pathlib import Path
+import re
+from monai.losses import DiceLoss
+from tqdm import tqdm
+
+
 
 parser = argparse.ArgumentParser(description="Swin UNETR segmentation pipeline")
-parser.add_argument("--data_dir", default="/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data", type=str, help="dataset directory")
+parser.add_argument("--data_dir", default="/dataset/dataset0/", type=str, help="dataset directory")
 parser.add_argument("--exp_name", default="test1", type=str, help="experiment name")
 parser.add_argument("--json_list", default="/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/default_splits_brats21.json", type=str, help="dataset json file")
 parser.add_argument("--fold", default=0, type=int, help="data fold")
@@ -54,7 +58,7 @@ parser.add_argument("--RandShiftIntensityd_prob", default=0.1, type=float, help=
 parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
 parser.add_argument("--use_checkpoint", action="store_true", help="use gradient checkpointing to save memory")
 parser.add_argument("--TS", default=None, type=str, help="load temperature.json")
-parser.add_argument("--ECE", action="store_true", help="use val_ece to calculate ECE")
+# parser.add_argument("--ECE", action="store_true", help="use val_ece to calculate ECE")
 parser.add_argument(
     "--pretrained_dir",
     default="./pretrained_models/fold1_f48_ep300_4gpu_dice0_9059/",
@@ -65,7 +69,7 @@ parser.add_argument(
 
 def main():
     args = parser.parse_args()
-    args.test_mode = True
+    args.test_mode = False
     # output_directory = "./outputs/" + args.exp_name
     # if not os.path.exists(output_directory):
     #     os.makedirs(output_directory)
@@ -73,25 +77,11 @@ def main():
     # test_loader = get_loader(args)
     test_loader, test_files = get_loader(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fold_root = join(args.pretrained_dir,f'fold_{args.fold}')
     # load ckpt
-    pretrained_pth = join(args.pretrained_dir,f'fold_{args.fold}', args.pretrained_model_name)
+    pretrained_pth = os.path.join(args.pretrained_dir,f'fold_{args.fold}', args.pretrained_model_name)
     # save path
-    if args.ECE:
-        output_directory = join(fold_root, 'validation_ece') # val_ece
-    else:
-        output_directory = join(fold_root, 'test') # test
-    if args.TS is not None:
-        output_directory = f'{output_directory}_{args.TS}'
+    output_directory = os.path.join(args.pretrained_dir, f'fold_{args.fold}')
     os.makedirs(output_directory, exist_ok=True)
-
-    output_directory_gt = join(output_directory,'gt')
-    output_directory_seg = join(output_directory,'seg')
-    output_directory_prob = join(output_directory,'prob')
-    os.makedirs(output_directory_gt, exist_ok=True)
-    os.makedirs(output_directory_seg, exist_ok=True)
-    os.makedirs(output_directory_prob, exist_ok=True)
-
     model = SwinUNETR(
         img_size=128,
         in_channels=args.in_channels,
@@ -106,20 +96,6 @@ def main():
     model.load_state_dict(model_dict)
     model.eval()
     model.to(device)
-    
-    ## JJ
-    if args.TS is not None:
-        potential_TS_path = join(fold_root, f'temperature_{args.TS}.json')  # JJ
-        print(f'loading temperature from {potential_TS_path}')
-        if os.path.exists(potential_TS_path):
-            temperature = json.load(open(potential_TS_path, 'r'))['temperature'][0]  # in list
-            print(f"Temperature Scaling: loading {temperature}")
-        else:
-            raise FileNotFoundError(
-                f"Missing: {potential_TS_path}. Please check your model path."
-            )
-    else:
-        temperature = None
 
     model_inferer_test = partial(
         sliding_window_inference,
@@ -129,42 +105,46 @@ def main():
         overlap=args.infer_overlap,
     )
     affine = None
+    logits_list, labels_list =[], []
+    print(f'doing TS with {len(test_loader)} samples ...')
     with torch.no_grad():
         for i, batch in enumerate(test_loader):  # len(test_loader)
             # batch.keys(): ['fold', 'image', 'label']
             image = batch["image"].cuda()
-            labels = batch["label"]# [1,3,240,240,155]
             img_name = os.path.basename(test_files[i]['label']).replace("_seg","")
-            # affine = batch["image_meta_dict"]["original_affine"][0].numpy()
-            # num = batch["image_meta_dict"]["filename_or_obj"][0].split("/")[-1].split("_")[1]
             print("Inference on case {}".format(img_name))
-            logits = model_inferer_test(image).squeeze(0)
-            if temperature is not None:
-                logits = logits/temperature
+            logits = model_inferer_test(image).squeeze(0)# .permute(1,2,3,0)
+            # prob = torch.sigmoid(logits)# [1, 3, 240, 240, 155]
+            labels =  batch["label"].squeeze(0).cuda()
+            # # append
+            # logits_list.append(logits.reshape(-1, 3))
+            # labels_list.append(labels.reshape(-1))
+            logits_list.append(logits)
+            labels_list.append(labels)
 
-            # ------------------------------------
-            # prob = F.softmax(logits, dim=0)
-            ## sum_prob = prob.sum(dim=0)
-            # seg = prob.detach().cpu().numpy().argmax(0).astype(np.uint8)# [3, 240, 240, 155]
-            # ------------------------------------
+    ## DiceLoss
+    logits_val, labels_val = torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0).float()
+    # loss_for_TS=DiceLoss(to_onehot_y=False, sigmoid=True)
+    loss_for_TS = nn.BCEWithLogitsLoss()  # nn.CrossEntropyLoss()  # BCE/CE
+    
+    max_iter = int(re.search(r'\d+', args.TS).group())
 
-            prob = torch.sigmoid(logits)# [1, 3, 240, 240, 155]
-            seg = prob.detach().cpu().numpy().astype(np.uint8)
-            seg = (seg > 0.5).astype(np.int8)
-            # save_seg: actually overwritten here
-            # seg[0]-et, seg[1]-wt, seg[2]-tc(nec)
-            seg_out = np.zeros((seg.shape[1], seg.shape[2], seg.shape[3]))
-            seg_out[seg[1] == 1] = 2  # wt (green+blue+red)
-            seg_out[seg[0] == 1] = 1 # enhanced (blue)
-            seg_out[seg[2] == 1] = 4 # nec/core (red)
-            # save_seg
-            nib.save(nib.Nifti1Image(seg_out.astype(np.uint8), affine), os.path.join(output_directory_seg, img_name))
-            # save_prob
-            np.savez_compressed(os.path.join(output_directory_prob, img_name.replace('nii.gz','npz')), probabilities=prob)
-            # save_gt
-            nib.save(nib.Nifti1Image(labels.astype(np.uint8), affine), os.path.join(output_directory_gt, img_name))
-        print("Finished inference!")
+    if 'list' in args.TS:
+        print(f'start to enumerate {max_iter} values ...')
+        temp_values = torch.linspace(1e-2, 5, steps=max_iter)  # 100 points
+        optim_temp, best_loss = -1, torch.finfo(torch.float).max
+        for temp in tqdm(temp_values, desc="Searching for optimal temperature"):
+            loss = loss_for_TS(logits_val / temp, labels_val)
+            if loss < best_loss:
+                best_loss = loss
+                optim_temp = temp
+        temperature = optim_temp.unsqueeze(0).detach().cpu().item()
+    elif 'lbfgs' in args.TS:
+        print("?????")
 
+    print(f'temperature: {temperature}')
+    result_as_list = {'temperature': [temperature]}
+    save_json(result_as_list, join(output_directory, f"temperature_{args.TS}.json"))
 
 if __name__ == "__main__":
     main()

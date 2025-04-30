@@ -12,11 +12,10 @@
 import json
 import math
 import os
-
 import numpy as np
 import torch
-
 from monai import data, transforms
+
 
 
 class Sampler(torch.utils.data.Sampler):
@@ -66,34 +65,58 @@ class Sampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
+# def datafold_read(datalist, basedir, fold=0, key="training"):
+#     with open(datalist) as f:
+#         json_data = json.load(f)
+#     json_data = json_data[key]
+#     for d in json_data:
+#         for k, v in d.items():
+#             if isinstance(d[k], list):
+#                 d[k] = [os.path.join(basedir, iv) for iv in d[k]]
+#             elif isinstance(d[k], str):
+#                 d[k] = os.path.join(basedir, d[k]) if len(d[k]) > 0 else d[k]
+#     tr,val = [], []
+#     for d in json_data:
+#         if "fold" in d and d["fold"] == fold:
+#             val.append(d)
+#         else:
+#             tr.append(d)
+#     return tr, val
+
+# (Pdb) print(d)
+# {'fold': 0, 'image': ['/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data/BraTS2021_01146/BraTS2021_01146_flair.nii.gz',
+#                       '/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data/BraTS2021_01146/BraTS2021_01146_t1ce.nii.gz',
+#                       '/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data/BraTS2021_01146/BraTS2021_01146_t1.nii.gz',
+#                       '/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data/BraTS2021_01146/BraTS2021_01146_t2.nii.gz'],
+#  'label': '/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data/BraTS2021_01146/BraTS2021_01146_seg.nii.gz'}
+
 def datafold_read(datalist, basedir, fold=0, key="training"):
     with open(datalist) as f:
         json_data = json.load(f)
-
     json_data = json_data[key]
-
     for d in json_data:
         for k, v in d.items():
             if isinstance(d[k], list):
                 d[k] = [os.path.join(basedir, iv) for iv in d[k]]
             elif isinstance(d[k], str):
                 d[k] = os.path.join(basedir, d[k]) if len(d[k]) > 0 else d[k]
-
-    tr = []
-    val = []
+    tr, test = [], []
     for d in json_data:
         if "fold" in d and d["fold"] == fold:
-            val.append(d)
+            test.append(d)
         else:
             tr.append(d)
-
-    return tr, val
+    tr_size, val_size = len(tr), int(0.1*len(tr))
+    tr, val_ece, val_TS = tr[:tr_size-2*val_size], tr[tr_size-2*val_size:tr_size-val_size], tr[-val_size:]
+    print("-----spliting tr, val_ece, val_TS... ", len(tr), len(test), len(val_ece), len(val_TS))
+    return tr, test, val_ece, val_TS
 
 
 def get_loader(args):
     data_dir = args.data_dir
     datalist_json = args.json_list
-    train_files, validation_files = datafold_read(datalist=datalist_json, basedir=data_dir, fold=args.fold)
+    # train_files, validation_files = datafold_read(datalist=datalist_json, basedir=data_dir, fold=args.fold)
+    train_files, test_files, val_ece_files, val_TS_files = datafold_read(datalist=datalist_json, basedir=data_dir, fold=args.fold)
     train_transform = transforms.Compose(
         [
             transforms.LoadImaged(keys=["image", "label"]),
@@ -132,32 +155,38 @@ def get_loader(args):
     )
 
     if args.test_mode:
-        import pdb;pdb.set_trace()
-        # why no file name??
-        val_ds = data.Dataset(data=validation_files, transform=test_transform) # validation_files[List]->["filename_or_obj"] 转化为batch里的key
+        if args.ECE:
+            val_ds = data.Dataset(data=val_ece_files, transform=test_transform) # val_ece_files
+        else:
+            val_ds = data.Dataset(data=test_files, transform=test_transform) # test_files
         val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
         test_loader = data.DataLoader(
             val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
         )
-
-        loader = test_loader
+        return test_loader, test_files
+    
     else:
-        train_ds = data.Dataset(data=train_files, transform=train_transform)
-
-        train_sampler = Sampler(train_ds) if args.distributed else None
-        train_loader = data.DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=(train_sampler is None),
-            num_workers=args.workers,
-            sampler=train_sampler,
-            pin_memory=True,
-        )
-        val_ds = data.Dataset(data=validation_files, transform=val_transform)
-        val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
-        val_loader = data.DataLoader(
-            val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
-        )
-        loader = [train_loader, val_loader]
-
-    return loader
+        if args.TS is not None:
+            val_ds = data.Dataset(data=val_TS_files, transform=test_transform)  # val_TS_files
+            val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
+            test_loader = data.DataLoader(
+                val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
+            )
+            return test_loader, test_files
+        else:
+            train_ds = data.Dataset(data=train_files, transform=train_transform) # train_files
+            train_sampler = Sampler(train_ds) if args.distributed else None
+            train_loader = data.DataLoader(
+                train_ds,
+                batch_size=args.batch_size,
+                shuffle=(train_sampler is None),
+                num_workers=args.workers,
+                sampler=train_sampler,
+                pin_memory=True,
+            )
+            val_ds = data.Dataset(data=val_ece_file, transform=val_transform)
+            val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
+            val_loader = data.DataLoader(
+                val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
+            )
+        return [train_loader, val_loader]
