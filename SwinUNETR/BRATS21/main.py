@@ -20,11 +20,11 @@ import torch.multiprocessing as mp
 import torch.nn.parallel
 import torch.utils.data.distributed
 from optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-from trainer import run_training,run_training_BTCV
+from trainer import run_training,run_training_softmax
 from utils.data_utils import get_loader
 
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceLoss,DiceCELoss
+from monai.losses import DiceLoss,DiceCELoss# CELoss
 from monai.metrics import DiceMetric
 from monai.networks.nets import SwinUNETR
 from monai.transforms import Activations, AsDiscrete, Compose
@@ -35,8 +35,8 @@ parser.add_argument("--checkpoint", default=None, help="start training from save
 parser.add_argument("--logdir", default="test", type=str, help="directory to save the tensorboard logs")
 parser.add_argument("--fold", default=0, type=int, help="data fold")
 parser.add_argument("--pretrained_model_name", default="model.pt", type=str, help="pretrained model name")
-parser.add_argument("--data_dir", default="/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/Brats2021_Training_Data", type=str, help="dataset directory")
-parser.add_argument("--json_list", default="/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/default_splits_brats21.json", type=str, help="dataset json file")
+parser.add_argument("--data_dir", default="/dodrio/scratch/projects/starting_2025_015/calibration/dataset/BraTS2021_Training_Data/", type=str, help="dataset directory")
+parser.add_argument("--json_list", default="/dodrio/scratch/projects/starting_2025_015/calibration/dataset/BraTS2021_Training_Data/default_splits_brats21.json", type=str, help="dataset json file")
 parser.add_argument("--save_checkpoint", action="store_true", help="save checkpoint during training")
 parser.add_argument("--max_epochs", default=300, type=int, help="max number of training epochs")
 parser.add_argument("--batch_size", default=1, type=int, help="number of batch size")
@@ -56,8 +56,8 @@ parser.add_argument("--norm_name", default="instance", type=str, help="normaliza
 parser.add_argument("--workers", default=8, type=int, help="number of workers")
 parser.add_argument("--feature_size", default=48, type=int, help="feature size")
 parser.add_argument("--in_channels", default=4, type=int, help="number of input channels")
-parser.add_argument("--out_channels", default=3, type=int, help="number of output channels")
-# parser.add_argument("--out_channels", default=4, type=int, help="number of output channels") # ->softmax
+# parser.add_argument("--out_channels", default=3, type=int, help="number of output channels")
+parser.add_argument("--out_channels", default=4, type=int, help="number of output channels") # ->softmax
 parser.add_argument("--cache_dataset", action="store_true", help="use monai Dataset class")
 parser.add_argument("--a_min", default=-175.0, type=float, help="a_min in ScaleIntensityRanged")
 parser.add_argument("--a_max", default=250.0, type=float, help="a_max in ScaleIntensityRanged")
@@ -85,6 +85,7 @@ parser.add_argument("--use_checkpoint", action="store_true", help="use gradient 
 parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
 parser.add_argument("--TS", default=None, type=str, help="load temperature.json")
 parser.add_argument("--ECE", action="store_true", help="use val_ece to calculate ECE")
+parser.add_argument("--loss", default=None, type=str, help="CE, Dice, DiceCE")
 parser.add_argument(
     "--pretrained_dir",
     default="./pretrained_models/fold1_f48_ep300_4gpu_dice0_9059/",
@@ -97,7 +98,9 @@ parser.add_argument("--squared_dice", action="store_true", help="use squared Dic
 def main():
     args = parser.parse_args()
     args.amp = not args.noamp
-    args.logdir = f"benchmark_brats21_nested/fold_{args.fold}"
+
+    args.logdir = f"benchmark_brats21_nested_{args.loss}/fold_{args.fold}"
+    
     if args.distributed:
         args.ngpus_per_node = torch.cuda.device_count()
         print("Found total gpus", args.ngpus_per_node)
@@ -142,20 +145,15 @@ def main_worker(gpu, args):
         print("Using pretrained weights")
 
 
-    if args.squared_dice:
-        dice_loss = DiceLoss(
-            to_onehot_y=False, sigmoid=True, squared_pred=True, smooth_nr=args.smooth_nr, smooth_dr=args.smooth_dr
-        )
-    else:
-        dice_loss = DiceLoss(to_onehot_y=False, sigmoid=True)
-
-    ## JJ: CrE-loss
-    # import pdb;pdb.set_trace()
-    post_sigmoid = Activations(sigmoid=True)
-    post_pred = AsDiscrete(argmax=False, logit_thresh=0.5)
-
-
-    dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH, get_not_nans=True)
+    # if args.squared_dice:
+    #     dice_loss = DiceLoss(
+    #         to_onehot_y=False, sigmoid=True, squared_pred=True, smooth_nr=args.smooth_nr, smooth_dr=args.smooth_dr
+    #     )
+    # else:
+    #     dice_loss = DiceLoss(to_onehot_y=False, sigmoid=True)
+    # post_sigmoid = Activations(sigmoid=True)
+    # post_pred = AsDiscrete(argmax=False, logit_thresh=0.5)
+    # dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH, get_not_nans=True)
     model_inferer = partial(
         sliding_window_inference,
         roi_size=inf_size,
@@ -212,30 +210,9 @@ def main_worker(gpu, args):
             scheduler.step(epoch=start_epoch)
     else:
         scheduler = None
-
-    semantic_classes = ["Dice_Val_TC", "Dice_Val_WT", "Dice_Val_ET"]
-    accuracy = run_training(
-        model=model,
-        train_loader=loader[0],
-        val_loader=loader[1],
-        optimizer=optimizer,
-        loss_func=dice_loss,
-        acc_func=dice_acc,
-        args=args,
-        model_inferer=model_inferer,
-        scheduler=scheduler,
-        start_epoch=start_epoch,
-        post_sigmoid=post_sigmoid,
-        post_pred=post_pred,
-        semantic_classes=semantic_classes,
-    )
-
     ######################################
-    # dice_loss = DiceCELoss(to_onehot_y=True, softmax=True)
-    # post_label = AsDiscrete(to_onehot=args.out_channels, n_classes=args.out_channels)
-    # post_pred = AsDiscrete(argmax=True, to_onehot=args.out_channels, n_classes=args.out_channels)
-    # dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN, get_not_nans=True)
-    # accuracy = run_training_BTCV(
+    # semantic_classes = ["Dice_Val_TC", "Dice_Val_WT", "Dice_Val_ET"]
+    # accuracy = run_training(
     #     model=model,
     #     train_loader=loader[0],
     #     val_loader=loader[1],
@@ -246,11 +223,38 @@ def main_worker(gpu, args):
     #     model_inferer=model_inferer,
     #     scheduler=scheduler,
     #     start_epoch=start_epoch,
-    #     post_label=post_label,
+    #     post_sigmoid=post_sigmoid,
     #     post_pred=post_pred,
+    #     semantic_classes=semantic_classes,
     # )
     ######################################
-
+    print(f'Loss is {args.loss}')
+    if args.loss =='Dice':
+        dice_loss = DiceLoss(to_onehot_y=False, softmax=True)
+    elif args.loss =='DiceCE':
+        dice_loss = DiceCELoss(to_onehot_y=False, softmax=True)
+    elif args.loss =='CE':
+        dice_loss = CELoss(to_onehot_y=False, softmax=True)
+    # dice_loss = CELoss(to_onehot_y=False, softmax=True)
+    # dice_loss = DiceCELoss(to_onehot_y=Flase, softmax=True)
+    post_label = AsDiscrete(to_onehot=None) # -> val
+    post_pred = AsDiscrete(argmax=True)# -> val
+    dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN, get_not_nans=True)
+    accuracy = run_training_softmax(
+        model=model,
+        train_loader=loader[0],
+        val_loader=loader[1],
+        optimizer=optimizer,
+        loss_func=dice_loss,
+        acc_func=dice_acc,
+        args=args,
+        model_inferer=model_inferer,
+        scheduler=scheduler,
+        start_epoch=start_epoch,
+        post_label=post_label,
+        post_pred=post_pred,
+    )
+    ######################################
     return accuracy
 
 

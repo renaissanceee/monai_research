@@ -29,15 +29,15 @@ from tqdm import tqdm
 
 
 parser = argparse.ArgumentParser(description="Swin UNETR segmentation pipeline")
-parser.add_argument("--data_dir", default="/dataset/dataset0/", type=str, help="dataset directory")
+parser.add_argument("--data_dir", default="/dodrio/scratch/projects/starting_2025_015/calibration/dataset/BraTS2021_Training_Data/", type=str, help="dataset directory")
 parser.add_argument("--exp_name", default="test1", type=str, help="experiment name")
-parser.add_argument("--json_list", default="/staging/leuven/stg_00081/jli/calibration/dataset/nnUNet_raw/default_splits_brats21.json", type=str, help="dataset json file")
+parser.add_argument("--json_list", default="/dodrio/scratch/projects/starting_2025_015/calibration/dataset/BraTS2021_Training_Data/default_splits_brats21.json", type=str, help="dataset json file")
 parser.add_argument("--fold", default=0, type=int, help="data fold")
 parser.add_argument("--pretrained_model_name", default="model_final.pt", type=str, help="pretrained model name")
 parser.add_argument("--feature_size", default=48, type=int, help="feature size")
 parser.add_argument("--infer_overlap", default=0.6, type=float, help="sliding window inference overlap")
 parser.add_argument("--in_channels", default=4, type=int, help="number of input channels")
-parser.add_argument("--out_channels", default=3, type=int, help="number of output channels")
+parser.add_argument("--out_channels", default=4, type=int, help="number of output channels")
 parser.add_argument("--a_min", default=-175.0, type=float, help="a_min in ScaleIntensityRanged")
 parser.add_argument("--a_max", default=250.0, type=float, help="a_max in ScaleIntensityRanged")
 parser.add_argument("--b_min", default=0.0, type=float, help="b_min in ScaleIntensityRanged")
@@ -58,10 +58,10 @@ parser.add_argument("--RandShiftIntensityd_prob", default=0.1, type=float, help=
 parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
 parser.add_argument("--use_checkpoint", action="store_true", help="use gradient checkpointing to save memory")
 parser.add_argument("--TS", default=None, type=str, help="load temperature.json")
-# parser.add_argument("--ECE", action="store_true", help="use val_ece to calculate ECE")
+parser.add_argument("--loss", default=None, type=str, help="CE, Dice, DiceCE")
 parser.add_argument(
     "--pretrained_dir",
-    default="./pretrained_models/fold1_f48_ep300_4gpu_dice0_9059/",
+    default="benchmark_brats21_nested",
     type=str,
     help="pretrained checkpoint directory",
 )
@@ -77,10 +77,10 @@ def main():
     # test_loader = get_loader(args)
     test_loader, test_files = get_loader(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # load ckpt
-    pretrained_pth = os.path.join(args.pretrained_dir,f'fold_{args.fold}', args.pretrained_model_name)
     # save path
-    output_directory = os.path.join(args.pretrained_dir, f'fold_{args.fold}')
+    output_directory = f'{args.pretrained_dir}_{args.loss}/fold_{args.fold}' 
+    # load ckpt
+    pretrained_pth = join(output_directory, args.pretrained_model_name)# benchmark_brats21_nested_CE/fold_0/model_final.pt
     os.makedirs(output_directory, exist_ok=True)
     model = SwinUNETR(
         img_size=128,
@@ -121,12 +121,14 @@ def main():
             # labels_list.append(labels.reshape(-1))
             logits_list.append(logits)
             labels_list.append(labels)
+            # break
 
     ## DiceLoss
     logits_val, labels_val = torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0).float()
     # loss_for_TS=DiceLoss(to_onehot_y=False, sigmoid=True)
-    loss_for_TS = nn.BCEWithLogitsLoss()  # nn.CrossEntropyLoss()  # BCE/CE
-    
+    # loss_for_TS = nn.BCEWithLogitsLoss()    # BCE/CE
+    loss_for_TS = nn.CrossEntropyLoss()
+
     max_iter = int(re.search(r'\d+', args.TS).group())
 
     if 'list' in args.TS:

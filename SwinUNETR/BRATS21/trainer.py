@@ -38,8 +38,8 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
         for param in model.parameters():
             param.grad = None
         with autocast(enabled=args.amp):
-            import pdb;pdb.set_trace()
             logits = model(data)
+            # import pdb;pdb.set_trace()
             loss = loss_func(logits, target)
         if args.amp:
             scaler.scale(loss).backward()
@@ -62,7 +62,7 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
                 "time {:.2f}s".format(time.time() - start_time),
             )
         start_time = time.time()
-        break # JJ
+        # break # JJ
     for param in model.parameters():
         param.grad = None
     return run_loss.avg
@@ -111,6 +111,74 @@ def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_sig
                 )
             start_time = time.time()
 
+    return run_acc.avg
+
+
+def val_epoch_softmax(model, loader, epoch, acc_func, args, model_inferer=None, post_label=None, post_pred=None):
+    model.eval()
+    run_acc = AverageMeter()
+    start_time = time.time()
+    with torch.no_grad():
+        for idx, batch_data in enumerate(loader):
+            if isinstance(batch_data, list):
+                data, target = batch_data
+            else:
+                data, target = batch_data["image"], batch_data["label"]
+            data, target = data.cuda(args.rank), target.cuda(args.rank)
+            with autocast(enabled=args.amp):
+                if model_inferer is not None:
+                    logits = model_inferer(data)
+                else:
+                    logits = model(data)
+            if not logits.is_cuda:
+                target = target.cpu()
+            val_labels_list = decollate_batch(target)
+            val_labels_convert = [post_label(val_label_tensor) for val_label_tensor in val_labels_list]
+            val_outputs_list = decollate_batch(logits)
+            val_output_convert = [post_pred(val_pred_tensor) for val_pred_tensor in val_outputs_list]
+            acc_func.reset()
+            acc_func(y_pred=val_output_convert, y=val_labels_convert)
+            acc, not_nans = acc_func.aggregate();acc = acc.cuda(args.rank)
+
+            if args.distributed:
+                acc_list, not_nans_list = distributed_all_gather(
+                    [acc, not_nans], out_numpy=True, is_valid=idx < loader.sampler.valid_length
+                )
+                for al, nl in zip(acc_list, not_nans_list):
+                    run_acc.update(al, n=nl)
+
+            else:
+                run_acc.update(acc.cpu().numpy(), n=not_nans.cpu().numpy())
+
+            if args.rank == 0:
+                avg_acc = np.mean(run_acc.avg)
+                print(
+                    "Val {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),
+                    "acc",
+                    avg_acc,
+                    "time {:.2f}s".format(time.time() - start_time),
+                )
+
+            # if args.rank == 0:
+                # import pdb;pdb.set_trace()
+                # Dice_BG = run_acc.avg[0] ## Error:run_acc.avg is tensor[0.66]
+                # Dice_Necrosis = run_acc.avg[1]
+                # Dice_Edema = run_acc.avg[2]
+                # Dice_ET = run_acc.avg[3]
+                # print(
+                #     "Val {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),
+                #     ", Dice_BG:",
+                #     Dice_BG,
+                #     ", Dice_Necrosis:",
+                #     Dice_Necrosis,
+                #     ", Dice_Edema:",
+                #     Dice_Edema,
+                #     ", Dice_ET:",
+                #     Dice_ET,
+                #     ", time {:.2f}s".format(time.time() - start_time),
+                # )
+
+            start_time = time.time()
     return run_acc.avg
 
 
@@ -213,7 +281,7 @@ def run_training(
                         save_checkpoint(
                             model, epoch, args, best_acc=val_acc_max, optimizer=optimizer, scheduler=scheduler
                         )
-            # pdb.set_trace()
+
             if args.rank == 0 and args.logdir is not None and args.save_checkpoint:
                 save_checkpoint(model, epoch, args, best_acc=val_acc_max, filename="model_final.pt")
                 if b_new_best:
@@ -227,19 +295,20 @@ def run_training(
 
     return val_acc_max
 
-def run_training_BTCV(
-    model,
-    train_loader,
-    val_loader,
-    optimizer,
-    loss_func,
-    acc_func,
-    args,
-    model_inferer=None,
-    scheduler=None,
-    start_epoch=0,
-    post_label=None,
-    post_pred=None,
+
+def run_training_softmax(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        loss_func,
+        acc_func,
+        args,
+        model_inferer=None,
+        scheduler=None,
+        start_epoch=0,
+        post_label=None,
+        post_pred=None,
 ):
     writer = None
     if args.logdir is not None and args.rank == 0:
@@ -272,7 +341,7 @@ def run_training_BTCV(
             if args.distributed:
                 torch.distributed.barrier()
             epoch_time = time.time()
-            val_avg_acc = val_epoch(
+            val_avg_acc = val_epoch_softmax(
                 model,
                 val_loader,
                 epoch=epoch,
@@ -306,7 +375,8 @@ def run_training_BTCV(
                 save_checkpoint(model, epoch, args, best_acc=val_acc_max, filename="model_final.pt")
                 if b_new_best:
                     print("Copying to model.pt new best model!!!!")
-                    shutil.copyfile(os.path.join(args.logdir, "model_final.pt"), os.path.join(args.logdir, "model.pt"))
+                    shutil.copyfile(os.path.join(args.logdir, "model_final.pt"),
+                                    os.path.join(args.logdir, "model.pt"))
 
         if scheduler is not None:
             scheduler.step()

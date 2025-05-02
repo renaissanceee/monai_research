@@ -55,6 +55,7 @@ parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimensi
 parser.add_argument("--use_checkpoint", action="store_true", help="use gradient checkpointing to save memory")
 parser.add_argument("--TS", default=None, type=str, help="load temperature.json")
 parser.add_argument("--ECE", action="store_true", help="use val_ece to calculate ECE")
+parser.add_argument("--loss", default=None, type=str, help="CE, Dice, DiceCE")
 parser.add_argument(
     "--pretrained_dir",
     default="./pretrained_models/fold1_f48_ep300_4gpu_dice0_9059/",
@@ -73,9 +74,9 @@ def main():
     # test_loader = get_loader(args)
     test_loader, test_files = get_loader(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    fold_root = join(args.pretrained_dir,f'fold_{args.fold}')
+    fold_root = f'{args.pretrained_dir}_{args.loss}/fold_{args.fold}'
     # load ckpt
-    pretrained_pth = join(args.pretrained_dir,f'fold_{args.fold}', args.pretrained_model_name)
+    pretrained_pth = join(fold_root, args.pretrained_model_name)# benchmark_brats21_nested_CE/fold_0/model_final.pt
     # save path
     if args.ECE:
         output_directory = join(fold_root, 'validation_ece') # val_ece
@@ -142,15 +143,14 @@ def main():
             if temperature is not None:
                 logits = logits/temperature
 
-            # ------------------------------------
-            # prob = F.softmax(logits, dim=0)
-            ## sum_prob = prob.sum(dim=0)
-            # seg = prob.detach().cpu().numpy().argmax(0).astype(np.uint8)# [3, 240, 240, 155]
-            # ------------------------------------
-
-            prob = torch.sigmoid(logits)# [1, 3, 240, 240, 155]
-            seg = prob.detach().cpu().numpy().astype(np.uint8)
-            seg = (seg > 0.5).astype(np.int8)
+            # -----------------softmax-------------------
+            prob = F.softmax(logits, dim=0)# sum_prob = prob.sum(dim=0)
+            seg = prob.detach().cpu().numpy().argmax(0).astype(np.uint8)# [3, 240, 240, 155]
+            # -----------------sigmoid-------------------
+            # prob = torch.sigmoid(logits)# [1, 3, 240, 240, 155]
+            # seg = prob.detach().cpu().numpy().astype(np.uint8)
+            # seg = (seg > 0.5).astype(np.int8)
+            # -----------------seg-------------------
             # save_seg: actually overwritten here
             # seg[0]-et, seg[1]-wt, seg[2]-tc(nec)
             seg_out = np.zeros((seg.shape[1], seg.shape[2], seg.shape[3]))
@@ -158,11 +158,11 @@ def main():
             seg_out[seg[0] == 1] = 1 # enhanced (blue)
             seg_out[seg[2] == 1] = 4 # nec/core (red)
             # save_seg
-            nib.save(nib.Nifti1Image(seg_out.astype(np.uint8), affine), os.path.join(output_directory_seg, img_name))
+            nib.save(nib.Nifti1Image(seg_out.astype(np.uint8), affine), join(output_directory_seg, img_name))
             # save_prob
-            np.savez_compressed(os.path.join(output_directory_prob, img_name.replace('nii.gz','npz')), probabilities=prob)
+            np.savez_compressed(join(output_directory_prob, img_name.replace('nii.gz','npz')), probabilities=prob)
             # save_gt
-            nib.save(nib.Nifti1Image(labels.astype(np.uint8), affine), os.path.join(output_directory_gt, img_name))
+            nib.save(nib.Nifti1Image(labels.astype(np.uint8), affine), join(output_directory_gt, img_name))
         print("Finished inference!")
 
 

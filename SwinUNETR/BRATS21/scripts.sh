@@ -1,14 +1,14 @@
 # SwinUnetr
-## train
-python main.py --logdir=benchmark_brats21_nested --save_checkpoint --use_checkpoint --noamp --val_every=10 --max_epochs=200 --fold=0
+## train (--loss={CE, Dice, DiceCE})
+python main.py --logdir=benchmark_brats21_nested --save_checkpoint --use_checkpoint --noamp --val_every=50 --max_epochs=200 --loss=Dice --fold=0
 ## do_TS
-python do_TS.py --pretrained_dir=benchmark_brats21_nested --fold=0 --TS=list_1000
+python do_TS.py --pretrained_dir=benchmark_brats21_nested --loss=Dice --fold=0 --TS=list_1000
 ## predict npz for ECE
-python test.py --pretrained_dir=benchmark_brats21_nested --fold=0 --ECE
-python test.py --pretrained_dir=benchmark_brats21_nested --fold=0 --ECE --TS list_1000
+python test.py --pretrained_dir=benchmark_brats21_nested --loss=Dice --fold=0 --ECE
+python test.py --pretrained_dir=benchmark_brats21_nested --loss=Dice --fold=0 --ECE --TS list_1000
 ## predict npz for metrics
-python test.py --pretrained_dir=benchmark_brats21_nested --fold=0
-python test.py --pretrained_dir=benchmark_brats21_nested --fold=0 --TS list_1000
+python test.py --pretrained_dir=benchmark_brats21_nested --loss=Dice --fold=0
+python test.py --pretrained_dir=benchmark_brats21_nested --loss=Dice --fold=0 --TS list_1000
 
 
 # ours

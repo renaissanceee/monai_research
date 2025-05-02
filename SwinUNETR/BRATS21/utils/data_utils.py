@@ -121,6 +121,7 @@ def get_loader(args):
         [
             transforms.LoadImaged(keys=["image", "label"]),
             transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
+            # transforms.ConvertToMultiChannelBasedOnBratsClassesdV2(keys="label"),
             transforms.CropForegroundd(
                 keys=["image", "label"], source_key="image", k_divisible=[args.roi_x, args.roi_y, args.roi_z]
             ),
@@ -140,6 +141,7 @@ def get_loader(args):
         [
             transforms.LoadImaged(keys=["image", "label"]),
             transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
+            # transforms.ConvertToMultiChannelBasedOnBratsClassesdV2(keys="label"),
             transforms.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             transforms.ToTensord(keys=["image", "label"]),
         ]
@@ -149,6 +151,7 @@ def get_loader(args):
         [
             transforms.LoadImaged(keys=["image", "label"]),
             transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
+            # transforms.ConvertToMultiChannelBasedOnBratsClassesdV2(keys="label"),
             transforms.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
             transforms.ToTensord(keys=["image", "label"]),
         ]
@@ -184,9 +187,11 @@ def get_loader(args):
                 sampler=train_sampler,
                 pin_memory=True,
             )
-            val_ds = data.Dataset(data=val_ece_file, transform=val_transform)
+            val_ds = data.Dataset(data=val_ece_files, transform=val_transform)
             val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
             val_loader = data.DataLoader(
                 val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
             )
-        return [train_loader, val_loader]
+            # batch = next(iter(train_loader))
+            # import pdb;pdb.set_trace()# print(next(iter(train_loader))['image'])
+            return [train_loader, val_loader]
