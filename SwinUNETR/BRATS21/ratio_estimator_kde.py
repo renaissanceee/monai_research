@@ -1,20 +1,29 @@
+import multiprocessing
 import os
 from pathlib import Path
 import re
 from copy import deepcopy
+from multiprocessing import Pool
 from typing import Tuple, List, Union, Optional, Any
 import matplotlib.pyplot as plt
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import subfiles, join, save_json, load_json, \
     isfile
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.imageio.base_reader_writer import BaseReaderWriter
+from nnunetv2.imageio.reader_writer_registry import determine_reader_writer_from_dataset_json, \
+    determine_reader_writer_from_file_ending
+from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
+from nnunetv2.utilities.json_export import recursive_fix_for_json_export
+from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 import torch
-from ratio_utils.ece_utils import calc_ece_kde,calc_bs,calc_v_bias,calc_nll,calc_ece_bins,detect_failure
-from ratio_utils.plot_utils import plot_r_and_range_dataset, plot_ce_and_range_dataset, plot_bins_dataset
-from sklearn.metrics import log_loss
+from nnunetv2.evaluation.ece_utils import calc_ece_kde,get_ece_bins,calc_bs,calc_v_bias,calc_nll,calc_ece_bins
+from nnunetv2.evaluation.plot_utils import plot_r_and_range_dataset, plot_ce_and_range_dataset, plot_bins_dataset
+from sklearn.metrics import accuracy_score, log_loss
 import torch.nn.functional as F
-from ratio_utils.seg_utils import gather_files, region_or_label_to_mask, region_or_label_to_mask_prob_add,region_or_label_to_mask_prob_max,get_ce_bound
-import nibabel as nib
-import argparse
+from nnunetv2.evaluation.seg_utils import gather_files, region_or_label_to_mask, region_or_label_to_mask_prob_add,\
+    compute_tp_fp_fn_tn,get_ce_bound
+
 
 def analyze_r_ce_std(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map, tensor_wt_gt_map, tensor_seg_prob_map,
                      tensor_seg_gt_map, ce_type, epsilon_y_mean_ece, epsilon_x_mean_ece):
@@ -25,30 +34,40 @@ def analyze_r_ce_std(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map,
     var_r = (y_bar ** 2 / x_bar ** 4 * var_x + var_y / x_bar ** 2 - 2 * y_bar / x_bar ** 3 * cov_x_y) / n
     sigma_r = var_r ** 0.5
     #####################
-    if 'kde' in ce_type:
-        p = int(re.search(r'\d+', ce_type).group())
-        repeat_for_kde = 5## ece_kde: repeate 5 times
-        list_epsilon_y, list_epsilon_x = [], []
-        for i in range(repeat_for_kde):
-            # print(f'JJ: repeate on time {i}...')
-            epsilon_y_sub, epsilon_x_sub = calc_ece_kde(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map,tensor_wt_gt_map, p)
-            list_epsilon_y.append(epsilon_y_sub.item())
-            list_epsilon_x.append(epsilon_x_sub.item())
-        epsilon_y, epsilon_x = np.mean(list_epsilon_y, axis=0), np.mean(list_epsilon_x, axis=0)
-    elif 'bins' in ce_type:
-        bins = int(re.search(r'\d+', ce_type).group())
-        epsilon_y, epsilon_x = calc_ece_bins(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map,tensor_wt_gt_map, bins)
-    elif ce_type == 'bs':
-        epsilon_y, epsilon_x = calc_bs(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map,tensor_wt_gt_map)
-    elif ce_type == 'nll':
-        epsilon_y, epsilon_x = calc_nll(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map, tensor_wt_gt_map)
-    #####################
-    if epsilon_y_mean_ece is not None and ce_type!='bs' and ce_type!='kde2': # kde1/bins15 in test-set
+    ## ece_kde: repeate 5 times
+    repeat_for_kde = 5
+    list_epsilon_y, list_epsilon_x = [], []
+    p = int(re.search(r'\d+', ce_type).group())
+    for i in range(repeat_for_kde):
+        # print(f'JJ: repeate on time {i}...')
+        epsilon_y_sub, epsilon_x_sub = calc_ece_kde(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map,tensor_wt_gt_map, p)
+        list_epsilon_y.append(epsilon_y_sub.item())
+        list_epsilon_x.append(epsilon_x_sub.item())
+    epsilon_y, epsilon_x = np.mean(list_epsilon_y, axis=0), np.mean(list_epsilon_x, axis=0)
+    ## ce-bound
+    if epsilon_y_mean_ece is not None: # test-set
         ce_left, ce_right = get_ce_bound(y_bar, x_bar, epsilon_y_mean_ece, epsilon_x_mean_ece)# ce_bound
         ce_left, ce_right = ce_left.item(), ce_right.item()
     else:
         ce_left, ce_right = 0, 0
-    return r_naive.item(), r_1_ord_corr.item(), r_2_ord_corr.item(), ce_left, ce_right, sigma_r.item(), epsilon_y.item(), epsilon_x.item()
+    return r_naive.item(), r_1_ord_corr.item(), r_2_ord_corr.item(), ce_left, ce_right, sigma_r.item(), epsilon_y, epsilon_x
+
+
+def analyze_r_std(tensor_nec_prob_map, tensor_wt_prob_map, tensor_nec_gt_map, tensor_wt_gt_map, tensor_seg_prob_map,
+                  tensor_seg_gt_map, epsilon_y, epsilon_x):
+    # r and std
+    y_bar, x_bar, cov_x_y, cov_x2_y, cov_y2_x, cov_x2_x, var_x, var_y, n = calc_statistic(tensor_nec_prob_map,
+                                                                                          tensor_wt_prob_map)
+    r_naive, r_1_ord_corr, r_2_ord_corr = estimate_r(y_bar, x_bar, cov_x_y, cov_x2_y, cov_y2_x, cov_x2_x, var_x, var_y,
+                                                     n)
+    var_r = (y_bar ** 2 / x_bar ** 4 * var_x + var_y / x_bar ** 2 - 2 * y_bar / x_bar ** 3 * cov_x_y) / n
+    sigma_r = var_r ** 0.5
+
+    ce_left = y_bar / x_bar - max(y_bar - epsilon_y, 0) / (x_bar + epsilon_x)  # extreme-case: move to 0
+    ce_right = (y_bar + epsilon_y) / max(x_bar - epsilon_x, 0) - y_bar / x_bar  # move to 1
+
+    return r_naive.item(), r_1_ord_corr.item(), r_2_ord_corr.item(), ce_left.item(), ce_right.item(), sigma_r.item()
+
 
 def calc_statistic(tensor_nec_prob_map, tensor_wt_prob_map):
     # mean/var
@@ -156,10 +175,9 @@ def compute_estimator(reference_file: str, prediction_file: str, probability_fil
                       epsilon_x_mean_ece: float = None,
                       ) -> dict:
     # load images
-    import pdb;pdb.set_trace()
     seg_ref = nib.load(reference_file).get_fdata()
     seg_pred = nib.load(prediction_file).get_fdata()
-    prob_pred = np.load(probability_file)['probabilities']  
+    prob_pred = np.load(probability_file)['probabilities']
 
     print(f"calculate r for {os.path.basename(reference_file)}")
     interested_region = (1,) if biomarker=='ntr' else (1, 4)
@@ -182,7 +200,6 @@ def compute_estimator(reference_file: str, prediction_file: str, probability_fil
         # nec_prob_map, nec_prob_counter = region_or_label_to_mask_prob_add(prob_pred, interested_region)  # numerator
         wt_prob_map, wt_prob_counter = region_or_label_to_mask_prob_max(prob_pred, (1, 2, 4))  # denominator
         nec_prob_map, nec_prob_counter = region_or_label_to_mask_prob_max(prob_pred, interested_region)  # numerator
-
     # prob+gt into tensor
     tensor_nec_prob_map = torch.from_numpy(nec_prob_map)  # [155,240,240]
     tensor_wt_prob_map = torch.from_numpy(wt_prob_map)
@@ -227,11 +244,13 @@ def compute_estimator(reference_file: str, prediction_file: str, probability_fil
     # v_bias
     results['ratio']['v_bias']['v_bias_y_L1'] = v_bias_y_L1
     results['ratio']['v_bias']['v_bias_x_L1'] = v_bias_x_L1
+    # results['ratio']['v_bias']['v_bias_y_L2'] = v_bias_y_L2
+    # results['ratio']['v_bias']['v_bias_x_L2'] = v_bias_x_L2
     # CE: y,x
     results['ratio'][f'epsilon_ece_{ce_type}']['epsilon_y'] = epsilon_y
     results['ratio'][f'epsilon_ece_{ce_type}']['epsilon_x'] = epsilon_x
 
-    if epsilon_y_mean_ece is not None and ce_type!='bs' and ce_type!='kde2':
+    if epsilon_y_mean_ece is not None:
         bounds_naive = generate_confidence_bounds(r_naive, ce_left, ce_right, sigma_r)
         bounds_1corr = generate_confidence_bounds(r_1_ord_corr, ce_left, ce_right, sigma_r)
         bounds_2corr = generate_confidence_bounds(r_2_ord_corr, ce_left, ce_right, sigma_r)
@@ -242,39 +261,51 @@ def compute_estimator(reference_file: str, prediction_file: str, probability_fil
 
     else:
         update_r_keys_zero(results)
-
-
     return results
 
 
 def compute_estimator_on_folder(folder_ref: str, folder_pred: str, output_file: str,
+                                image_reader_writer: BaseReaderWriter,
+                                file_ending: str,
+                                regions_or_labels: Union[List[int], List[Union[int, Tuple[int, ...]]]],
+                                ignore_label: int = None,
+                                num_processes: int = default_num_processes,
+                                chill: bool = True,
                                 binary: bool = False,
                                 biomarker: str ='ntr',
                                 ce_type: str = "bins",  # "kde", nll, bs
+                                exp: int = None,  # diff exp for kde,
                                 ) -> dict:
+    """
+    output_file must end with .json; can be None
+    """
+    if output_file is not None:
+        assert output_file.endswith('.json'), 'output_file should end with .json'
     if binary:
         folder_save = join(folder_pred, f"ratio_metrics_binary_{biomarker}")
     else:
         folder_save = join(folder_pred, f"ratio_metrics_prob_{biomarker}")
     os.makedirs(folder_save, exist_ok=True)
-    if 'test' in folder_pred and ce_type!='bs' and ce_type!='kde2':
+    if 'test' in folder_pred and ce_type!='kde2':
         path_ece_json = join(folder_save.replace('test', 'validation_ece'), f"{ce_type}_{output_file}")
         if 'binary' in path_ece_json:
             path_ece_json=path_ece_json.replace('binary','prob') # ECE_interval still from prob
-        print(f'loading epsilon from {path_ece_json}') # bins15_ratio.json
+        print(f'loading epsilon from {path_ece_json}') # kde1_ratio.json
         mean_ece = load_json(path_ece_json)
         epsilon_y_mean_ece = mean_ece[f'mean_ece_{ce_type}']['epsilon_y']
         epsilon_x_mean_ece = mean_ece[f'mean_ece_{ce_type}']['epsilon_x']
-    else:    # elif 'validation' in folder_pred:
+    else:
+    # elif 'validation' in folder_pred:
         epsilon_y_mean_ece, epsilon_x_mean_ece = None, None
-    files_pred, files_prob, files_ref = gather_files(folder_pred, folder_ref)
+    files_pred, files_prob, files_ref = gather_files(folder_pred, folder_ref, ".nii.gz", chill)
     results = []
     ################################################
-    i = 0
-    for ref, pred, prob in zip(files_ref, files_pred, files_prob):
-        i += 1
-        if i > 10 or i < 8: continue  # JJ: first two samples
-        result = compute_estimator(ref, pred, prob, binary, biomarker, ce_type, epsilon_y_mean_ece, epsilon_x_mean_ece)
+    # i = 0
+    for ref, pred, prob in zip(files_ref, files_pred, files_prob, ):
+        # i += 1
+        # if i > 10 or i < 8: continue  # JJ: first two samples
+        result = compute_estimator(ref, pred, prob, image_reader_writer, regions_or_labels, ignore_label,
+                                   binary, biomarker, ce_type, epsilon_y_mean_ece, epsilon_x_mean_ece)
         results.append(result)
 
     ################################################
@@ -363,21 +394,68 @@ def compute_estimator_on_folder(folder_ref: str, folder_pred: str, output_file: 
     return paired_samples[f'epsilon_ece_{ce_type}']  # ['epsilon_ece_kde']['epsilon_y'] and 'x' for 2 np.arrays
 
 
-if __name__ == '__main__':
+def compute_metrics_on_folder2(folder_ref: str, folder_pred: str, dataset_json_file: str, plans_file: str,
+                               output_file: str = None,
+                               num_processes: int = default_num_processes,
+                               chill: bool = False,
+                               binary: bool = False,
+                               biomarker: str ='ntr',
+                               ce_type: str = "bins"  # "kde", nll, bs
+                               ):
+    dataset_json = load_json(dataset_json_file)
+    file_ending = dataset_json['file_ending']  # .nii.gz for segs
+    # file_ending = ".npz" #.npz for probs
+
+    # get reader writer class
+    example_file = subfiles(folder_ref, suffix=file_ending, join=True)[0]
+    rw = determine_reader_writer_from_dataset_json(dataset_json, example_file)()
+
+    # maybe auto set output file
+    if output_file is None:
+        output_file = 'ratio.json'
+
+    lm = PlansManager(plans_file).get_label_manager(dataset_json)
+
+    # output_file_exp = output_file.replace('.json', f"_1e4_{exp}.json")  # 1e4
+    ##  ['epsilon_ece_kde']['epsilon_y'] and 'x'  for 2 np.arrays
+    compute_estimator_on_folder(folder_ref, folder_pred, output_file, rw, file_ending,
+                                               lm.foreground_regions if lm.has_regions else lm.foreground_labels,
+                                               lm.ignore_label,
+                                               num_processes, chill=chill, binary=binary,biomarker=biomarker,
+                                               ce_type=ce_type,exp=None)
+
+
+
+
+
+def evaluate_folder_entry_point():
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('gt_folder', type=str, help='folder with gt segmentations')
     parser.add_argument('pred_folder', type=str, help='folder with predicted segmentations')
-    parser.add_argument('-o', type=str, required=False, default='ratio.json',
+    parser.add_argument('-djfile', type=str, required=False,
+                        help='dataset.json file')
+    parser.add_argument('-pfile', type=str, required=False,
+                        help='plans.json file')
+    parser.add_argument('-o', type=str, required=False, default=None,
                         help='Output file. Optional. Default: pred_folder/summary.json')
+    parser.add_argument('-np', type=int, required=False, default=default_num_processes,
+                        help=f'number of processes used. Optional. Default: {default_num_processes}')
+    parser.add_argument('--chill', action='store_true',
+                        help='dont crash if folder_pred does not have all files that are present in folder_gt')
     parser.add_argument('--binary', action='store_true', help='use seg instead of prob for ratio est')
     parser.add_argument('--TS', type=str, required=False, default=None, help='Temperature Scaling')
     parser.add_argument('--ce_type', required=True, type=str, help='bins15, kde1, nll, bs')
     parser.add_argument('--biomarker', required=True, type=str, help='ntr, ctr')
     args = parser.parse_args()
-
+    if args.pfile is None:
+        args.pfile = Path(args.pred_folder.rstrip("/")).parents[1] / "plans.json"
+    if args.djfile is None:
+        args.djfile = Path(args.pred_folder.rstrip("/")).parents[1] / "dataset.json"
     if args.TS is not None:
         basename = os.path.basename(args.pred_folder)
         args.pred_folder = args.pred_folder.replace(basename, basename + f'_TS_{args.TS}')
         print(f'calculating from ... {args.pred_folder}')
+    compute_metrics_on_folder2(args.gt_folder, args.pred_folder, args.djfile, args.pfile, args.o, args.np,
+                               chill=args.chill, binary=args.binary, biomarker=args.biomarker,ce_type=args.ce_type)
 
-    compute_estimator_on_folder(args.gt_folder, args.pred_folder, args.o, args.binary, args.biomarker,args.ce_type)
